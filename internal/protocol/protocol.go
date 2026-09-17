@@ -7,22 +7,25 @@ import "encoding/json"
 // 帧类型常量：客户端请求（join/chat/ack/resume/ping）与服务端推送
 // （welcome/event/snapshot/pong/error/bye）。
 const (
-	TypeJoin     = "join"     // 客户端 -> 服务端：加入房间
-	TypeChat     = "chat"     // 客户端 -> 服务端：发送聊天消息
-	TypeAck      = "ack"      // 客户端 -> 服务端：确认已收到的事件序号
-	TypeResume   = "resume"   // 客户端 -> 服务端：断线续传
-	TypePing     = "ping"     // 客户端 -> 服务端：心跳
-	TypeWelcome  = "welcome"  // 服务端 -> 客户端：join 成功，附会话令牌与快照
-	TypeEvent    = "event"    // 服务端 -> 客户端：房间事件（成员变动/聊天）
-	TypeSnapshot = "snapshot" // 服务端 -> 客户端：全量快照（续传缺口太大时使用）
-	TypePong     = "pong"     // 服务端 -> 客户端：心跳应答
-	TypeError    = "error"    // 服务端 -> 客户端：请求出错
-	TypeBye      = "bye"      // 服务端 -> 客户端：主动断开
+	TypeJoin     = "join"      // 客户端 -> 服务端：加入房间
+	TypeChat     = "chat"      // 客户端 -> 服务端：发送聊天消息
+	TypeAck      = "ack"       // 客户端 -> 服务端：确认已收到的事件序号
+	TypeResume   = "resume"    // 客户端 -> 服务端：断线续传
+	TypePing     = "ping"      // 客户端 -> 服务端：心跳
+	TypeWelcome  = "welcome"   // 服务端 -> 客户端：join 成功，附会话令牌与快照
+	TypeEvent    = "event"     // 服务端 -> 客户端：房间事件（成员变动/聊天）
+	TypeSnapshot = "snapshot"  // 服务端 -> 客户端：全量快照（续传缺口太大时使用）
+	TypeResumeOk = "resume_ok" // 服务端 -> 客户端：续传完成应答（无论是否有补发内容）
+	TypePong     = "pong"      // 服务端 -> 客户端：心跳应答
+	TypeError    = "error"     // 服务端 -> 客户端：请求出错
+	TypeBye      = "bye"       // 服务端 -> 客户端：主动断开
 
 	// 事件类型（Event.Type 的取值）
-	EvMemberJoin  = "member_join"  // 有成员加入
-	EvMemberLeave = "member_leave" // 有成员离开
-	EvChat        = "chat"         // 聊天消息
+	EvMemberJoin    = "member_join"    // 有成员加入
+	EvMemberOnline  = "member_online"  // 离线成员通过 resume 重新上线
+	EvMemberOffline = "member_offline" // 成员连接断开（会话保留，可续传回来）
+	EvMemberLeave   = "member_leave"   // 预留：显式离开房间（当前断连语义为 offline）
+	EvChat          = "chat"           // 聊天消息
 )
 
 // Envelope 是每个帧的外层 JSON 包装；Payload 的具体类型由 Type 决定，
@@ -55,6 +58,13 @@ type Resume struct {
 	SessionToken string `json:"sessionToken"` // 上次 Welcome 下发的令牌
 }
 
+// ResumeOk 是 TypeResumeOk 的载荷：续传完成的确认。
+// 即使没有任何补发内容（fromSeq 已是最新）也会发送，
+// 让客户端能区分"续传成功"与"请求丢失"。
+type ResumeOk struct {
+	Seq uint64 `json:"seq"` // 客户端已追平到的事件序号
+}
+
 // Welcome 是 TypeWelcome 的载荷：join 成功后下发，
 // 包含续传所需的会话令牌和当前房间全量快照。
 type Welcome struct {
@@ -66,7 +76,7 @@ type Welcome struct {
 // Event 是 TypeEvent 的载荷：一条带序号的房间事件。
 type Event struct {
 	Seq     uint64          `json:"seq"`
-	Type    string          `json:"type"` // EvMemberJoin / EvMemberLeave / EvChat
+	Type    string          `json:"type"` // EvMemberJoin / EvMemberOnline / EvMemberOffline / EvChat
 	Payload json.RawMessage `json:"payload"`
 }
 

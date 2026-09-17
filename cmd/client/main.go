@@ -120,6 +120,14 @@ func main() {
 				lastSeq = s.Seq
 				saveSession(sessPath, *roomName, *name, token, lastSeq)
 				fmt.Printf("[snapshot] members=%v chats=%v seq=%d\n", s.Members, s.Chats, s.Seq)
+			case protocol.TypeResumeOk:
+				// 续传完成确认：以服务端告知的序号为准落盘
+				// （即使没有补发任何事件也会收到，表示续传成功）
+				var ro protocol.ResumeOk
+				_ = protocol.Decode(env.Payload, &ro)
+				lastSeq = ro.Seq
+				saveSession(sessPath, *roomName, *name, token, lastSeq)
+				fmt.Printf("[resume_ok] caught up seq=%d\n", ro.Seq)
 			case protocol.TypeEvent:
 				// 普通事件：推进序号、落盘、回 ack
 				var e protocol.Event

@@ -18,7 +18,7 @@ const (
 // Event 是房间内发生的一条带序号的事件。
 type Event struct {
 	Seq     uint64          // 单调递增序号，断线续传以此对齐
-	Type    string          // protocol.EvMemberJoin / EvMemberLeave / EvChat
+	Type    string          // protocol.EvMemberJoin / EvMemberOnline / EvMemberOffline / EvChat
 	Payload json.RawMessage // 事件载荷，延迟解码
 }
 
@@ -65,6 +65,7 @@ type Room struct {
 	logCap  int               // 日志容量上限
 	chats   []string          // 近期聊天记录（"名字: 内容"）
 	members map[string]string // token -> 显示名
+	online  map[string]bool   // token -> 是否在线（断连只标记离线，成员关系保留以支持续传）
 }
 
 func newRoom(name string, logCap int) *Room {
@@ -72,10 +73,12 @@ func newRoom(name string, logCap int) *Room {
 		name:    name,
 		logCap:  logCap,
 		members: make(map[string]string),
+		online:  make(map[string]bool),
 	}
 }
 
 // Snapshot 返回房间当前状态的全量快照。
+// 成员列表包含离线成员（断连只标记离线，会话保留）。
 func (r *Room) Snapshot() protocol.Snapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -94,6 +97,7 @@ func (r *Room) Join(name string) (token string, snap protocol.Snapshot, ev Event
 	defer r.mu.Unlock()
 	token = fmt.Sprintf("%s-%d", name, r.seq+1)
 	r.members[token] = name
+	r.online[token] = true
 	payload, _ := json.Marshal(protocol.MemberPayload{Name: name})
 	ev = r.appendLocked(protocol.EvMemberJoin, payload)
 	snap = protocol.Snapshot{
@@ -104,17 +108,34 @@ func (r *Room) Join(name string) (token string, snap protocol.Snapshot, ev Event
 	return token, snap, ev, nil
 }
 
-// Leave 让指定令牌的成员离开；成员不存在时 ok 为 false。
-func (r *Room) Leave(token string) (ev Event, ok bool) {
+// MarkOffline 把指定令牌的成员标记为离线（连接断开时调用）。
+// 成员关系保留在房间内，之后可用同一令牌 resume 回来；
+// 仅当成员当前在线时记录 member_offline 事件并返回 ok=true。
+func (r *Room) MarkOffline(token string) (ev Event, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	name, exists := r.members[token]
-	if !exists {
+	if !exists || !r.online[token] {
 		return Event{}, false
 	}
-	delete(r.members, token)
+	r.online[token] = false
 	payload, _ := json.Marshal(protocol.MemberPayload{Name: name})
-	return r.appendLocked(protocol.EvMemberLeave, payload), true
+	return r.appendLocked(protocol.EvMemberOffline, payload), true
+}
+
+// MarkOnline 把指定令牌的成员标记为在线（resume 成功时调用）。
+// 仅当成员此前处于离线状态时记录 member_online 事件并返回 changed=true；
+// 重复 resume（成员已在线）不会重复产生事件。
+func (r *Room) MarkOnline(token string) (ev Event, changed bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	name, exists := r.members[token]
+	if !exists || r.online[token] {
+		return Event{}, false
+	}
+	r.online[token] = true
+	payload, _ := json.Marshal(protocol.MemberPayload{Name: name})
+	return r.appendLocked(protocol.EvMemberOnline, payload), true
 }
 
 // Chat 追加一条聊天消息并记录 chat 事件；令牌无效时返回错误。
@@ -135,20 +156,14 @@ func (r *Room) Chat(token, text string) (ev Event, err error) {
 	return r.appendLocked(protocol.EvChat, payload), nil
 }
 
-// ValidateSession 检查令牌是否仍是有效成员。
-func (r *Room) ValidateSession(token string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	_, ok := r.members[token]
-	return ok
-}
-
 // EnsureSession 确保令牌对应的会话存在（用于 resume 时重新绑定成员）。
+// 新建的会话初始为离线状态，由调用方随后用 MarkOnline 置为在线。
 func (r *Room) EnsureSession(token, name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.members[token]; !ok {
 		r.members[token] = name
+		r.online[token] = false
 	}
 }
 

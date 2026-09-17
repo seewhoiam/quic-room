@@ -68,7 +68,7 @@ func main() {
 }
 
 // handleConn 处理单个客户端连接：接受一条流并循环读帧、分发处理。
-// 连接断开时自动让成员离开房间并广播 leave 事件。
+// 连接断开时把成员标记为离线（member_offline），成员关系保留供续传。
 func handleConn(conn quic.Connection, hub *room.Hub) {
 	defer conn.CloseWithError(0, "bye")
 	// 约定：客户端在连接上打开的第一条（双向）流用于协议通信
@@ -79,13 +79,13 @@ func handleConn(conn quic.Connection, hub *room.Hub) {
 	defer stream.Close()
 
 	cc := &clientConn{stream: stream, w: stream}
-	// 连接结束时：把连接移出广播集合并清理房间成员身份，
-	// 在 rs.mu 内向其他人广播离开事件，保证与聊天事件的相对顺序。
+	// 连接结束时：把连接移出广播集合，并把成员标记为离线（不删除成员，
+	// 会话保留供 resume 续传），在 rs.mu 内广播 member_offline 事件保证顺序。
 	defer func() {
 		if cc.room != nil && cc.token != "" {
 			rs := stateFor(cc.room)
 			rs.mu.Lock()
-			ev, ok := cc.room.Leave(cc.token)
+			ev, ok := cc.room.MarkOffline(cc.token)
 			track(cc.room, cc, false)
 			if ok {
 				broadcast(rs, nil, protocol.TypeEvent, protocol.Event{
@@ -234,7 +234,9 @@ func dispatch(cc *clientConn, hub *room.Hub, env protocol.Envelope) error {
 		cc.lastAck = p.Seq
 		return nil
 	case protocol.TypeResume:
-		// 断线续传：凭令牌恢复会话，按 fromSeq 补发事件或下发全量快照。
+		// 断线续传：凭令牌恢复会话，按 fromSeq 补发事件或下发全量快照，
+		// 最后总是回一个 resume_ok 应答（即使没有补发内容），
+		// 让客户端能区分"续传成功"与"请求丢失"。
 		// 全程持有 rs.mu：先 track 再补发的窗口期内若有新事件广播，
 		// 恢复中的客户端会先收到新事件再收到旧快照/补发事件，造成乱序。
 		var p protocol.Resume
@@ -253,21 +255,33 @@ func dispatch(cc *clientConn, hub *room.Hub, env protocol.Envelope) error {
 		r.EnsureSession(p.SessionToken, name)
 		cc.room, cc.token, cc.name = r, p.SessionToken, name
 		track(r, cc, true)
+		// 先计算补发内容，再标记上线 —— 否则 online 事件会混进重放列表，
+		// 导致恢复中的客户端收到重复事件
 		needSnap, snap, evs := r.Resume(p.FromSeq)
+		onEv, cameOnline := r.MarkOnline(p.SessionToken)
+		caughtUp := p.FromSeq
 		if needSnap {
 			// 事件缺口太大：下发全量快照，客户端直接追平到 snap.Seq
 			if err := cc.send(protocol.TypeSnapshot, snap); err != nil {
 				return err
 			}
+			caughtUp = snap.Seq
 		} else {
 			// 缺口可重放：逐条补发 fromSeq 之后的事件
 			for _, ev := range evs {
 				if err := cc.send(protocol.TypeEvent, protocol.Event{Seq: ev.Seq, Type: ev.Type, Payload: ev.Payload}); err != nil {
 					return err
 				}
+				caughtUp = ev.Seq
 			}
 		}
-		return nil
+		// 离线 -> 在线的转换要广播给全房间（含恢复者自己）
+		if cameOnline {
+			caughtUp = onEv.Seq
+			broadcast(rs, nil, protocol.TypeEvent, protocol.Event{Seq: onEv.Seq, Type: onEv.Type, Payload: onEv.Payload})
+		}
+		// 续传完成应答：告知客户端已追平到的序号
+		return cc.send(protocol.TypeResumeOk, protocol.ResumeOk{Seq: caughtUp})
 	default:
 		return errStr("unknown type " + env.Type)
 	}

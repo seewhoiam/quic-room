@@ -31,9 +31,11 @@ go run ./cmd/client -addr 127.0.0.1:4242 -room demo -name bob
 ## 协议摘要
 
 Client → Server: `join` / `chat` / `ack` / `resume` / `ping`  
-Server → Client: `welcome` / `event` / `snapshot` / `pong` / `error` / `bye`
+Server → Client: `welcome` / `event` / `snapshot` / `resume_ok` / `pong` / `error` / `bye`
 
-事件类型：`member_join` / `member_leave` / `chat`  
+事件类型：`member_join` / `member_offline` / `member_online` / `chat`（`member_leave` 预留）  
+断连不删成员，只标记离线（`member_offline`）；resume 回来时广播 `member_online`，
+并总是以 `resume_ok` 应答收尾（即使没有补发内容）。  
 事件日志窗口默认 1024；`fromSeq` 过旧则先发 `snapshot` 再追增量。
 
 ## 测试
