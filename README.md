@@ -42,3 +42,11 @@ Server → Client: `welcome` / `event` / `snapshot` / `pong` / `error` / `bye`
 go test ./...
 go build ./...
 ```
+
+## 代码风格
+
+提交前请跑一下 `gofmt`（仓库根目录的 [.editorconfig](.editorconfig) 已声明 tab 缩进，主流编辑器会自动遵循）：
+
+```bash
+gofmt -w .
+```

@@ -1,0 +1,9 @@
+# IDE
+.idea/
+.vscode/
+
+# Go
+*.test
+*.out
+/bin/
+/dist/
