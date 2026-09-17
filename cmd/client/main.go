@@ -9,10 +9,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -25,6 +27,21 @@ type sessionFile struct {
 	LastSeq uint64 `json:"lastSeq"` // 已收到的最大事件序号
 	Room    string `json:"room"`
 	Name    string `json:"name"`
+}
+
+// frameWriter 串行化对同一流/Writer 的帧写入。
+// ack（读循环）、ping（心跳 goroutine）、chat（主 goroutine）来自不同 goroutine，
+// 若不加锁，4 字节帧头与 body 可能交错写入，导致对端 ReadFrame 解析错乱。
+type frameWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+// Write 原子地写入一个完整帧。
+func (f *frameWriter) Write(typ string, payload any) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return protocol.WriteFrame(f.w, typ, payload)
 }
 
 func main() {
@@ -46,11 +63,12 @@ func main() {
 	}
 	defer conn.CloseWithError(0, "bye")
 
-	// 打开一条双向流承载协议帧
+	// 打开一条双向流承载协议帧；所有写操作都必须经过 out（带锁）
 	stream, err := conn.OpenStreamSync(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
+	out := &frameWriter{w: stream}
 
 	// 会话文件按 房间+名字 区分，存放在系统临时目录
 	sessPath := filepath.Join(os.TempDir(), fmt.Sprintf("quic-room-%s-%s.session", *roomName, *name))
@@ -66,14 +84,14 @@ func main() {
 
 	// 有旧会话则 resume 续传，否则走 join 加入
 	if token != "" {
-		if err := protocol.WriteFrame(stream, protocol.TypeResume, protocol.Resume{
+		if err := out.Write(protocol.TypeResume, protocol.Resume{
 			Room: *roomName, FromSeq: lastSeq, SessionToken: token,
 		}); err != nil {
 			log.Fatal(err)
 		}
 		log.Printf("resume room=%s fromSeq=%d", *roomName, lastSeq)
 	} else {
-		if err := protocol.WriteFrame(stream, protocol.TypeJoin, protocol.Join{Room: *roomName, Name: *name}); err != nil {
+		if err := out.Write(protocol.TypeJoin, protocol.Join{Room: *roomName, Name: *name}); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -108,7 +126,7 @@ func main() {
 				_ = protocol.Decode(env.Payload, &e)
 				lastSeq = e.Seq
 				saveSession(sessPath, *roomName, *name, token, lastSeq)
-				_ = protocol.WriteFrame(stream, protocol.TypeAck, protocol.Ack{Seq: e.Seq})
+				_ = out.Write(protocol.TypeAck, protocol.Ack{Seq: e.Seq})
 				fmt.Printf("[event %d %s] %s\n", e.Seq, e.Type, string(e.Payload))
 			case protocol.TypeError:
 				fmt.Printf("[error] %s\n", string(env.Payload))
@@ -127,7 +145,7 @@ func main() {
 		t := time.NewTicker(15 * time.Second)
 		defer t.Stop()
 		for range t.C {
-			_ = protocol.WriteFrame(stream, protocol.TypePing, nil)
+			_ = out.Write(protocol.TypePing, nil)
 		}
 	}()
 
@@ -139,7 +157,7 @@ func main() {
 		if text == "" {
 			continue
 		}
-		if err := protocol.WriteFrame(stream, protocol.TypeChat, protocol.Chat{Text: text}); err != nil {
+		if err := out.Write(protocol.TypeChat, protocol.Chat{Text: text}); err != nil {
 			log.Fatal(err)
 		}
 	}

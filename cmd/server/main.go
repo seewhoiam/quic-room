@@ -22,6 +22,7 @@ import (
 type clientConn struct {
 	mu      sync.Mutex
 	stream  quic.Stream
+	w       io.Writer  // 写端（== stream），独立成字段便于测试替换
 	token   string     // 会话令牌（join/resume 后赋值）
 	room    *room.Room // 所在房间
 	name    string     // 显示名
@@ -32,7 +33,7 @@ type clientConn struct {
 func (c *clientConn) send(typ string, payload any) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return protocol.WriteFrame(c.stream, typ, payload)
+	return protocol.WriteFrame(c.w, typ, payload)
 }
 
 func main() {
@@ -77,15 +78,21 @@ func handleConn(conn quic.Connection, hub *room.Hub) {
 	}
 	defer stream.Close()
 
-	cc := &clientConn{stream: stream}
-	// 连接结束时清理房间成员身份，并向房间内其他人广播离开事件
+	cc := &clientConn{stream: stream, w: stream}
+	// 连接结束时：把连接移出广播集合并清理房间成员身份，
+	// 在 rs.mu 内向其他人广播离开事件，保证与聊天事件的相对顺序。
 	defer func() {
 		if cc.room != nil && cc.token != "" {
-			if ev, ok := cc.room.Leave(cc.token); ok {
-				broadcast(cc.room, nil, protocol.TypeEvent, protocol.Event{
+			rs := stateFor(cc.room)
+			rs.mu.Lock()
+			ev, ok := cc.room.Leave(cc.token)
+			track(cc.room, cc, false)
+			if ok {
+				broadcast(rs, nil, protocol.TypeEvent, protocol.Event{
 					Seq: ev.Seq, Type: ev.Type, Payload: ev.Payload,
 				})
 			}
+			rs.mu.Unlock()
 		}
 	}()
 
@@ -104,26 +111,46 @@ func handleConn(conn quic.Connection, hub *room.Hub) {
 	}
 }
 
-// roomClients 记录每个房间内当前在线的连接，用于广播。
+// roomState 是一个房间的广播状态。
+// mu 串行化"房间变更（分配 seq）+ 广播"整个序列：事件的 seq 在房间锁内分配，
+// 但发送在房间锁外进行，若不额外串行化，并发广播可能乱序到达客户端，
+// 导致客户端记录的 lastSeq 回退、续传重复拉取。同房间的变更+广播必须持有 mu。
+type roomState struct {
+	mu      sync.Mutex
+	clients map[*clientConn]struct{} // 房间内在线连接
+}
+
+// roomClients 记录每个房间的广播状态。
 var (
 	roomClientsMu sync.Mutex
-	roomClients   = map[*room.Room]map[*clientConn]struct{}{}
+	roomClients   = map[*room.Room]*roomState{}
 )
+
+// stateFor 返回房间的广播状态，不存在则创建。
+func stateFor(r *room.Room) *roomState {
+	roomClientsMu.Lock()
+	defer roomClientsMu.Unlock()
+	rs := roomClients[r]
+	if rs == nil {
+		rs = &roomState{clients: map[*clientConn]struct{}{}}
+		roomClients[r] = rs
+	}
+	return rs
+}
 
 // track 把连接加入/移出房间的广播集合。
 func track(r *room.Room, c *clientConn, add bool) {
 	roomClientsMu.Lock()
 	defer roomClientsMu.Unlock()
-	m := roomClients[r]
-	if m == nil {
-		m = map[*clientConn]struct{}{}
-		roomClients[r] = m
+	rs := roomClients[r]
+	if rs == nil {
+		return // 调用方应先经 stateFor 创建
 	}
 	if add {
-		m[c] = struct{}{}
+		rs.clients[c] = struct{}{}
 	} else {
-		delete(m, c)
-		if len(m) == 0 {
+		delete(rs.clients, c)
+		if len(rs.clients) == 0 {
 			// 房间没有在线连接时清理映射，避免内存泄漏
 			delete(roomClients, r)
 		}
@@ -131,12 +158,13 @@ func track(r *room.Room, c *clientConn, add bool) {
 }
 
 // broadcast 向房间内除 except 外的所有连接发送一个帧。
+// 调用方必须持有 rs.mu，以保证同一房间的事件按 seq 递增顺序送达。
 // 发送失败只忽略（连接断开后的清理由 handleConn 的 defer 负责）。
-func broadcast(r *room.Room, except *clientConn, typ string, payload any) {
+func broadcast(rs *roomState, except *clientConn, typ string, payload any) {
 	roomClientsMu.Lock()
 	// 先在锁内拷贝连接列表，避免持锁发送阻塞
-	clients := make([]*clientConn, 0, len(roomClients[r]))
-	for c := range roomClients[r] {
+	clients := make([]*clientConn, 0, len(rs.clients))
+	for c := range rs.clients {
 		if c != except {
 			clients = append(clients, c)
 		}
@@ -155,12 +183,17 @@ func dispatch(cc *clientConn, hub *room.Hub, env protocol.Envelope) error {
 		// 心跳：直接回 pong
 		return cc.send(protocol.TypePong, nil)
 	case protocol.TypeJoin:
-		// 加入房间：签发令牌、下发欢迎帧与快照、向其他成员广播 join 事件
+		// 加入房间：签发令牌、下发欢迎帧与快照、向其他成员广播 join 事件。
+		// 全程持有 rs.mu：保证"分配 seq → 下发 → 广播"与其他事件不交错，
+		// 新成员也不会在 Welcome 之前先收到别人的事件。
 		var p protocol.Join
 		if err := protocol.Decode(env.Payload, &p); err != nil {
 			return err
 		}
 		r := hub.Get(p.Room)
+		rs := stateFor(r)
+		rs.mu.Lock()
+		defer rs.mu.Unlock()
 		token, snap, ev, err := r.Join(p.Name)
 		if err != nil {
 			return err
@@ -172,10 +205,10 @@ func dispatch(cc *clientConn, hub *room.Hub, env protocol.Envelope) error {
 		}); err != nil {
 			return err
 		}
-		broadcast(r, cc, protocol.TypeEvent, protocol.Event{Seq: ev.Seq, Type: ev.Type, Payload: ev.Payload})
+		broadcast(rs, cc, protocol.TypeEvent, protocol.Event{Seq: ev.Seq, Type: ev.Type, Payload: ev.Payload})
 		return nil
 	case protocol.TypeChat:
-		// 聊天：追加到房间记录并向所有成员（含自己）广播
+		// 聊天：在 rs.mu 内"追加事件 + 广播"，保证事件按 seq 顺序送达
 		if cc.room == nil {
 			return errStr("not joined")
 		}
@@ -183,11 +216,14 @@ func dispatch(cc *clientConn, hub *room.Hub, env protocol.Envelope) error {
 		if err := protocol.Decode(env.Payload, &p); err != nil {
 			return err
 		}
+		rs := stateFor(cc.room)
+		rs.mu.Lock()
+		defer rs.mu.Unlock()
 		ev, err := cc.room.Chat(cc.token, p.Text)
 		if err != nil {
 			return err
 		}
-		broadcast(cc.room, nil, protocol.TypeEvent, protocol.Event{Seq: ev.Seq, Type: ev.Type, Payload: ev.Payload})
+		broadcast(rs, nil, protocol.TypeEvent, protocol.Event{Seq: ev.Seq, Type: ev.Type, Payload: ev.Payload})
 		return nil
 	case protocol.TypeAck:
 		// 客户端确认事件序号：仅记录，暂未用于重传
@@ -198,12 +234,17 @@ func dispatch(cc *clientConn, hub *room.Hub, env protocol.Envelope) error {
 		cc.lastAck = p.Seq
 		return nil
 	case protocol.TypeResume:
-		// 断线续传：凭令牌恢复会话，按 fromSeq 补发事件或下发全量快照
+		// 断线续传：凭令牌恢复会话，按 fromSeq 补发事件或下发全量快照。
+		// 全程持有 rs.mu：先 track 再补发的窗口期内若有新事件广播，
+		// 恢复中的客户端会先收到新事件再收到旧快照/补发事件，造成乱序。
 		var p protocol.Resume
 		if err := protocol.Decode(env.Payload, &p); err != nil {
 			return err
 		}
 		r := hub.Get(p.Room)
+		rs := stateFor(r)
+		rs.mu.Lock()
+		defer rs.mu.Unlock()
 		// demo 约定：令牌内嵌了显示名前缀（"名字-序号"），据此重建成员绑定
 		name := p.SessionToken
 		if i := indexByte(name, '-'); i >= 0 {
@@ -225,10 +266,6 @@ func dispatch(cc *clientConn, hub *room.Hub, env protocol.Envelope) error {
 					return err
 				}
 			}
-		}
-		if needSnap {
-			// 快照已包含 snap.Seq 之前的全部状态，无需再重放事件
-			_ = snap
 		}
 		return nil
 	default:
